@@ -1,7 +1,7 @@
 """
 Non-ergodic Mess3 dataset for next-token prediction.
 
-Each sequence is drawn entirely from one ergodic component (one (x, a) pair).
+Each sequence is drawn entirely from one ergodic component (one (s, r) pair).
 The transformer never sees the component label — it's metadata for analysis.
 """
 
@@ -9,22 +9,22 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from mess3_hmm_version1 import Mess3HMM
+from .hmm import Mess3HMM
 
 
 # --- Component definitions ---------------------------------------------------
-# Each tuple is (x, a).
-# x: off-diagonal asymmetry in transitions (0 = symmetric)
-# a: switching rate (0 = always stay, 1 = always switch)
+# Each tuple is (s, r).
+# s: self-transition strength (higher = stickier, beliefs stay near one vertex)
+# r: asymmetry ratio (r=1 symmetric, r>1 clockwise bias, r<1 counterclockwise)
 #
-# These were chosen to occupy different dynamical regimes:
-#   0: sticky, nearly symmetric  — beliefs hug one vertex for long stretches
-#   1: volatile, strongly asymmetric — beliefs jump around the simplex unevenly
-#   2: moderate switching, strong asymmetry — intermediate but with a directional bias
+# These occupy different dynamical regimes:
+#   0: sticky, mild asymmetry — beliefs hug one vertex for long stretches
+#   1: volatile, strong clockwise bias — beliefs jump around unevenly
+#   2: moderate, counterclockwise bias — intermediate dynamics, opposite direction
 DEFAULT_COMPONENTS = [
-    (0.05, 0.3),   # sticky, nearly symmetric
-    (0.40, 0.7),   # volatile, strongly asymmetric
-    (0.15, 0.9),   # fast-switching, moderate asymmetry
+    (0.8, 1.2),   # sticky, mild clockwise
+    (0.4, 3.0),   # volatile, strong clockwise
+    (0.6, 0.3),   # moderate, counterclockwise
 ]
 
 
@@ -62,8 +62,8 @@ class Mess3NonErgodicDataset(Dataset):
         self.observations = []   # list of (seq_len,) int arrays
         self.component_ids = []  # list of ints
 
-        for comp_id, (x, a) in enumerate(component_params):
-            hmm = Mess3HMM(x=x, a=a, seed=int(rng.integers(2**31)))
+        for comp_id, (s, r) in enumerate(component_params):
+            hmm = Mess3HMM(s=s, r=r, seed=int(rng.integers(2**31)))
             for _ in range(num_sequences_per_component):
                 hmm.rng = np.random.default_rng(int(rng.integers(2**31)))
                 _z, y = hmm.sample_sequence(seq_len)
@@ -116,6 +116,35 @@ def make_dataloaders(
     return train_loader, val_loader, dataset
 
 
+def compute_beliefs_for_sequences(tokens, comp_ids, component_params=None):
+    """
+    Compute ground-truth HMM beliefs for observed token sequences.
+
+    tokens: (N, T) int array
+    comp_ids: (N,) int array
+    component_params: list of (s, r) tuples; defaults to DEFAULT_COMPONENTS
+    Returns: (N, T, 3) belief array
+    """
+    if component_params is None:
+        component_params = DEFAULT_COMPONENTS
+
+    hmms = {i: Mess3HMM(s=s, r=r) for i, (s, r) in enumerate(component_params)}
+    N, T = tokens.shape
+    beliefs = np.zeros((N, T, 3))
+
+    for i in range(N):
+        hmm = hmms[comp_ids[i]]
+        alpha = hmm.pi.copy()
+        for t in range(T):
+            alpha = alpha @ hmm.T_x[tokens[i, t]]
+            s = alpha.sum()
+            if s > 0:
+                alpha = alpha / s
+            beliefs[i, t] = alpha
+
+    return beliefs
+
+
 def generate_component_beliefs(component_params=None, num_sequences=500, seq_len=64, seed=7):
     """
     Generate beliefs for each component separately. For visualization/analysis.
@@ -130,8 +159,8 @@ def generate_component_beliefs(component_params=None, num_sequences=500, seq_len
     rng = np.random.default_rng(seed)
     beliefs_by_component = []
 
-    for x, a in component_params:
-        hmm = Mess3HMM(x=x, a=a, seed=int(rng.integers(2**31)))
+    for s, r in component_params:
+        hmm = Mess3HMM(s=s, r=r, seed=int(rng.integers(2**31)))
         all_beliefs = []
         for _ in range(num_sequences):
             hmm.rng = np.random.default_rng(int(rng.integers(2**31)))
@@ -165,8 +194,8 @@ if __name__ == "__main__":
         obs = ds.observations[mask]
         counts = np.bincount(obs.ravel(), minlength=3)
         freqs = counts / counts.sum()
-        x, a = ds.component_params[c]
-        print(f"  Component {c} (x={x}, a={a}): {freqs.round(3)}")
+        s, r = ds.component_params[c]
+        print(f"  Component {c} (s={s}, r={r}): {freqs.round(3)}")
 
     # dataloader check
     train_loader, val_loader, _ = make_dataloaders(

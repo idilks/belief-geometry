@@ -1,21 +1,9 @@
-#!/usr/bin/env python3
 """
-Mock belief-geometry script for a 3-state 'mess3-like' HMM.
+Belief geometry visualization for the Mess3 process.
 
-This is a simplified, stand-alone analogue of experiments/figure_generation/figure1/scripts/mess3_beliefs.py,
-but specialized to our single-factor Mess3HMM.
-
-It:
-  - builds a Mess3HMM
-  - generates many belief states p(z_t | y_{1:t}) over 3 hidden states
-  - embeds beliefs into:
-      * a 2D equilateral triangle (simplex embedding)
-      * a 3D space using PCA on "joint" belief-like vectors
-  - colors points based on belief mass
-  - renders Matplotlib figures
-
-Usage:
-    python mess3_belief_geometry.py
+Generates many belief states p(z_t | y_{0:t-1}) over 3 hidden states,
+embeds them in a 2D equilateral triangle (simplex) and a 3D PCA view,
+colors points based on belief mass.
 """
 
 from __future__ import annotations
@@ -27,7 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from sklearn.decomposition import PCA
 
-from mess3_hmm import Mess3HMM, generate_beliefs_batch
+from .hmm import Mess3HMM, generate_beliefs_batch
 
 
 # -----------------------------------------------------------------------------
@@ -67,6 +55,34 @@ FACTOR_ANCHORS = np.array([
 ])
 
 
+def get_comp_colors(n: int) -> np.ndarray:
+    """
+    Return (n, 3) RGB array of distinguishable component colors.
+    First 3 match the classic red/orange/blue; extras are green, purple, etc.
+    """
+    palette = np.array([
+        [0.89, 0.10, 0.11],  # red
+        [0.99, 0.55, 0.00],  # orange
+        [0.12, 0.47, 0.71],  # blue
+        [0.20, 0.63, 0.17],  # green
+        [0.58, 0.40, 0.74],  # purple
+        [0.42, 0.24, 0.10],  # brown
+        [0.89, 0.47, 0.76],  # pink
+        [0.50, 0.50, 0.50],  # gray
+    ])
+    if n <= len(palette):
+        return palette[:n]
+    # tile if somehow more than 8
+    reps = (n // len(palette)) + 1
+    return np.tile(palette, (reps, 1))[:n]
+
+
+def get_comp_colors_hex(n: int) -> list:
+    """Return n component colors as hex strings."""
+    rgb = get_comp_colors(n)
+    return [f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}" for r, g, b in rgb]
+
+
 def three_vertex_colors(beliefs: np.ndarray, anchors: np.ndarray = FACTOR_ANCHORS,
                         alpha: float = 1.5) -> np.ndarray:
     """
@@ -81,7 +97,6 @@ def three_vertex_colors(beliefs: np.ndarray, anchors: np.ndarray = FACTOR_ANCHOR
         colors: (N, 3) RGB in [0,1].
     """
     b = np.clip(beliefs, 0.0, 1.0)
-    # emphasize large probabilities
     w = b ** alpha
     w_sum = w.sum(axis=1, keepdims=True)
     w_sum = np.where(w_sum > 0, w_sum, 1.0)
@@ -95,24 +110,17 @@ def three_vertex_colors(beliefs: np.ndarray, anchors: np.ndarray = FACTOR_ANCHOR
 
 def pca_embed_beliefs(beliefs: np.ndarray, random_state: int = 0) -> tuple[np.ndarray, PCA]:
     """
-    Embed 3-state beliefs into 3D via PCA on a simple "joint-like" representation.
+    Embed 3-state beliefs into 3D via PCA.
 
-    Since we only have one factor, we can either:
-      - run PCA directly on beliefs (shape (N,3)), or
-      - create a synthetic 9D "joint" (outer product of beliefs with itself) and
-        then do PCA, which mimics the 9D joint in the real repo.
-
-    Here we do the "joint" trick to look more like their Figure-1 pipeline.
+    The 3-simplex is a 2D manifold in R^3, so PCA with 3 components captures
+    all variance. The third component will be near zero.
 
     Returns:
         coords_3d: (N, 3)
         pca:       fitted PCA object
     """
-    # synthetic joint: 3x3 outer product -> flatten to 9D
-    joint = np.einsum("ni,nj->nij", beliefs, beliefs).reshape(-1, 9)
-
     pca = PCA(n_components=3, random_state=random_state)
-    coords_3d = pca.fit_transform(joint)
+    coords_3d = pca.fit_transform(beliefs)
     return coords_3d, pca
 
 
@@ -132,20 +140,14 @@ def style_3d_axes(ax, elev: float = 30, azim: float = -60):
 
 
 def set_equal_3d_limits(ax, coords: np.ndarray, margin: float = 0.05):
-    """
-    Set equal x,y,z limits around coords, with a small margin.
-    """
     mins = coords.min(axis=0)
     maxs = coords.max(axis=0)
     center = 0.5 * (mins + maxs)
     span = (maxs - mins).max()
     half = 0.5 * span * (1.0 + margin)
-    x_min, x_max = center[0] - half, center[0] + half
-    y_min, y_max = center[1] - half, center[1] + half
-    z_min, z_max = center[2] - half, center[2] + half
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_zlim(z_min, z_max)
+    ax.set_xlim(center[0] - half, center[0] + half)
+    ax.set_ylim(center[1] - half, center[1] + half)
+    ax.set_zlim(center[2] - half, center[2] + half)
 
 
 # -----------------------------------------------------------------------------
@@ -157,18 +159,10 @@ def make_belief_geometry_figure(
     out_dir: Path,
     title_prefix: str = "Mess3 Belief Geometry",
 ):
-    """
-    Create a figure showing:
-      - beliefs in 3D (PCA embedding of synthetic joint)
-      - beliefs in 2D (triangle / simplex)
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3D embedding via PCA
     coords_3d, pca = pca_embed_beliefs(beliefs, random_state=0)
     colors = three_vertex_colors(beliefs, FACTOR_ANCHORS, alpha=1.5)
-
-    # 2D triangle embedding
     coords_2d = simplex_to_triangle(beliefs)
     verts_2d = simplex_vertices_2d()
 
@@ -180,34 +174,23 @@ def make_belief_geometry_figure(
 
     # 3D scatter
     ax3d.scatter(
-        coords_3d[:, 0],
-        coords_3d[:, 1],
-        coords_3d[:, 2],
-        s=6.0,
-        c=colors,
-        linewidths=0.0,
-        depthshade=True,
+        coords_3d[:, 0], coords_3d[:, 1], coords_3d[:, 2],
+        s=6.0, c=colors, linewidths=0.0, depthshade=True,
     )
     style_3d_axes(ax3d, elev=30, azim=-60)
     set_equal_3d_limits(ax3d, coords_3d)
-    ax3d.set_title(f"{title_prefix}\n3D PCA of synthetic joint", fontsize=13)
+    ax3d.set_title(f"{title_prefix}\n3D PCA", fontsize=13)
 
     # 2D simplex scatter
     ax2d.scatter(
-        coords_2d[:, 0],
-        coords_2d[:, 1],
-        s=8.0,
-        c=colors,
-        alpha=0.7,
-        linewidths=0.0,
+        coords_2d[:, 0], coords_2d[:, 1],
+        s=8.0, c=colors, alpha=0.7, linewidths=0.0,
     )
-    # draw triangle edges
     tri = verts_2d
     for i in range(3):
         j = (i + 1) % 3
-        x = [tri[i, 0], tri[j, 0]]
-        y = [tri[i, 1], tri[j, 1]]
-        ax2d.plot(x, y, color="black", linewidth=1.0)
+        ax2d.plot([tri[i, 0], tri[j, 0]], [tri[i, 1], tri[j, 1]],
+                  color="black", linewidth=1.0)
 
     ax2d.set_aspect("equal")
     ax2d.set_xticks([])
@@ -231,23 +214,18 @@ def make_belief_geometry_figure(
 # -----------------------------------------------------------------------------
 
 def main():
-    # 1) Build our mock 'mess3' HMM
-    hmm = Mess3HMM(x=0.15, a=0.6, seed=7)
+    hmm = Mess3HMM(s=0.7, r=1.5, seed=7)
 
-    # 2) Generate many beliefs (like generate_beliefs in mess3_beliefs.py)
     beliefs = generate_beliefs_batch(
         hmm,
-        batch_size=400,   # can increase if you want more points
+        batch_size=400,
         seq_len=50,
         seed=7,
     )
-    print("Beliefs shape:", beliefs.shape)  # (N, 3)
+    print("Beliefs shape:", beliefs.shape)
 
-    # 3) Create output dir and plot
     out_dir = Path("mess3_geometry_outputs")
     make_belief_geometry_figure(beliefs, out_dir)
-
-
 
 
 if __name__ == "__main__":
